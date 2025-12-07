@@ -1,0 +1,1 @@
+streamlit run app_with_auth_and_cloud.py
