@@ -1,464 +1,395 @@
-# streamlit_budget_app.py
-"""
-Comprehensive personal Budget Planning Streamlit App
-Features:
-- Income & Expenses with category management (food, travel, rent, entertainment, etc.)
-- Weekly/Monthly budgets per category
-- Recurring payments (EMI, rent, subscriptions) tracking
-- Spending alerts when usage exceeds budget thresholds
-- History views: 1 week, 1 month, 3 months, 6 months, 1 year
-- Pie charts & bar graphs (plotly)
-- Cash flow timeline (income vs expense)
-- Savings goals with progress bars and reminders
-- Receipt OCR (pytesseract)
-- Export to Excel and PDF
-- Local SQLite storage + optional cloud sync stub
-
-Notes:
-- This is a single-file Streamlit app. Install dependencies listed below.
-- Cloud sync and biometric login are implemented as stubs/placeholders with guidance.
-
-Requirements (pip):
-streamlit pandas plotly pillow pytesseract fpdf numpy sqlalchemy
-
-Optional for better OCR: install tesseract-ocr on your OS.
-
-Run:
-streamlit run streamlit_budget_app.py
-"""
-
+# app_with_auth_and_cloud.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import sqlite3
-import io
-import base64
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-from fpdf import FPDF
 from PIL import Image
 import pytesseract
+import hashlib
 import os
-from sqlalchemy import create_engine
+import io
+import smtplib
+from email.message import EmailMessage
+import json
+from dotenv import load_dotenv
 
-# ---------- Configuration ----------
-DB_PATH = "budget_app.db"
-DEFAULT_CATEGORIES = ["Food", "Travel", "Rent", "Entertainment", "Bills", "Shopping", "Subscriptions", "Salary", "Other"]
-ALERT_THRESHOLD_DEFAULT = 0.9  # 90%
+# Optional Firebase imports
+FIREBASE_AVAILABLE = False
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    FIREBASE_AVAILABLE = True
+except Exception:
+    FIREBASE_AVAILABLE = False
 
-# ---------- Utility functions ----------
+load_dotenv()  # load .env if present
 
-def get_engine(path=DB_PATH):
-    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
-    return engine
+st.set_page_config(page_title="Budget Planner — Auth & Cloud", layout="wide")
+st.title("💼 Smart Budget Planner — Login, Cloud & Email Reminders")
 
+# ---------- Config ----------
+FIREBASE_SA_JSON = os.getenv("FIREBASE_SA_JSON")  # path to service account json
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = os.getenv("SMTP_PORT")
+SMTP_EMAIL = os.getenv("SMTP_EMAIL")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
-def init_db():
-    engine = get_engine()
-    with engine.connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                type TEXT,
-                category TEXT,
-                amount REAL,
-                note TEXT,
-                recurring_id INTEGER
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS recurring (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                category TEXT,
-                amount REAL,
-                start_date TEXT,
-                frequency TEXT,
-                note TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS budgets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT,
-                period TEXT,
-                amount REAL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS goals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                target_amount REAL,
-                current_amount REAL,
-                deadline TEXT,
-                note TEXT
-            )
-            """
-        )
-    return engine
-
-
-@st.cache_data
-def load_transactions():
-    engine = get_engine()
+# ---------- Firebase Initialization (optional) ----------
+db = None
+use_firestore = False
+if FIREBASE_AVAILABLE and FIREBASE_SA_JSON and os.path.exists(FIREBASE_SA_JSON):
     try:
-        df = pd.read_sql("SELECT * FROM transactions ORDER BY date DESC", engine)
-        if not df.empty:
-            df['date'] = pd.to_datetime(df['date'])
-        return df
-    except Exception:
-        return pd.DataFrame(columns=['id','date','type','category','amount','note','recurring_id'])
-
-
-def add_transaction(date, ttype, category, amount, note='', recurring_id=None):
-    engine = get_engine()
-    df = pd.DataFrame([{ 'date': pd.to_datetime(date).isoformat(), 'type': ttype, 'category': category, 'amount': float(amount), 'note': note, 'recurring_id': recurring_id }])
-    df.to_sql('transactions', engine, if_exists='append', index=False)
-    st.session_state['dirty'] = True
-
-
-def add_recurring(name, category, amount, start_date, frequency, note=''):
-    engine = get_engine()
-    df = pd.DataFrame([{ 'name': name, 'category': category, 'amount': amount, 'start_date': pd.to_datetime(start_date).isoformat(), 'frequency': frequency, 'note': note }])
-    df.to_sql('recurring', engine, if_exists='append', index=False)
-    st.session_state['dirty'] = True
-
-
-def add_budget(category, period, amount):
-    engine = get_engine()
-    df = pd.DataFrame([{ 'category': category, 'period': period, 'amount': float(amount) }])
-    df.to_sql('budgets', engine, if_exists='append', index=False)
-    st.session_state['dirty'] = True
-
-
-def add_goal(name, target_amount, current_amount, deadline, note=''):
-    engine = get_engine()
-    df = pd.DataFrame([{ 'name': name, 'target_amount': float(target_amount), 'current_amount': float(current_amount), 'deadline': pd.to_datetime(deadline).isoformat(), 'note': note }])
-    df.to_sql('goals', engine, if_exists='append', index=False)
-    st.session_state['dirty'] = True
-
-
-# ---------- Forecasting helper (simple linear trend) ----------
-
-def small_forecast(series: pd.Series, periods=3):
-    # series index should be numeric (e.g., 0..n) or datetime
-    if series.dropna().shape[0] < 2:
-        return [series.iloc[-1]] * periods if not series.empty else [0]*periods
-    x = np.arange(len(series))
-    y = series.values
-    coeffs = np.polyfit(x, y, 1)
-    future_x = np.arange(len(series), len(series)+periods)
-    preds = coeffs[0]*future_x + coeffs[1]
-    return preds.tolist()
-
-
-# ---------- OCR helper ----------
-
-def extract_text_from_image(image_file) -> str:
-    try:
-        img = Image.open(image_file)
-        text = pytesseract.image_to_string(img)
-        return text
+        cred = credentials.Certificate(FIREBASE_SA_JSON)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        use_firestore = True
+        st.info("Connected to Firebase Firestore (cloud DB enabled).")
     except Exception as e:
-        return f"OCR error: {e}"
+        st.warning(f"Could not initialize Firebase: {e}\nFalling back to local storage.")
+else:
+    if FIREBASE_SA_JSON:
+        st.warning("Firebase libs missing or service account JSON path invalid. Using local mode.")
+    else:
+        st.info("Firebase not configured. Using local (session) storage.")
 
+# ---------- Utility helpers ----------
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-# ---------- Export helpers ----------
+def send_email(recipient_email: str, subject: str, body: str) -> bool:
+    """Send email via SMTP. Returns True if ok."""
+    if not (SMTP_SERVER and SMTP_PORT and SMTP_EMAIL and SMTP_PASSWORD):
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = recipient_email
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_SERVER, int(SMTP_PORT)) as smtp:
+            smtp.starttls()
+            smtp.login(SMTP_EMAIL, SMTP_PASSWORD)
+            smtp.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"Email send failed: {e}")
+        return False
 
-def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    towrite = io.BytesIO()
-    df.to_excel(towrite, index=False, sheet_name='Transactions')
-    towrite.seek(0)
-    return towrite.read()
+# ---------- Cloud functions (if Firestore enabled) ----------
+def firestore_get_user(email):
+    doc = db.collection("users").document(email).get()
+    return doc.to_dict() if doc.exists else None
 
+def firestore_create_user(email, hashed_password):
+    db.collection("users").document(email).set({
+        "password_hash": hashed_password,
+        "created_at": datetime.utcnow().isoformat()
+    })
+    # create empty subcollections
+    db.collection("users").document(email).collection("transactions")  # will be created on write
 
-def df_to_pdf_bytes(df: pd.DataFrame, title='Report') -> bytes:
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, txt=title, ln=True, align='C')
-    pdf.ln(5)
-    # simple table
-    col_width = pdf.w / 4.5
-    row_height = pdf.font_size * 1.5
-    for i, col in enumerate(df.columns):
-        pdf.cell(col_width, row_height, str(col), border=1)
-    pdf.ln(row_height)
-    for index, row in df.iterrows():
-        for item in row:
-            pdf.cell(col_width, row_height, str(item)[:30], border=1)
-        pdf.ln(row_height)
-    return pdf.output(dest='S').encode('latin-1')
+def firestore_save_transaction(email, tx):
+    # tx is dict
+    db.collection("users").document(email).collection("transactions").add(tx)
 
+def firestore_get_transactions(email):
+    docs = db.collection("users").document(email).collection("transactions").order_by("date", direction=firestore.Query.DESCENDING).stream()
+    rows = []
+    for d in docs:
+        doc = d.to_dict()
+        rows.append(doc)
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["date","type","category","amount","notes"])
 
-# ---------- App UI & Logic ----------
+def firestore_save_reminder(email, reminder):
+    db.collection("users").document(email).collection("reminders").add(reminder)
 
-def main():
-    st.set_page_config(page_title="Budget Planner", layout='wide')
-    st.title("💸 Budget Planner & Expense Tracker")
+def firestore_get_reminders(email):
+    docs = db.collection("users").document(email).collection("reminders").order_by("due", direction=firestore.Query.ASCENDING).stream()
+    rows = []
+    for d in docs:
+        rows.append(d.to_dict())
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["name","amount","due"])
 
-    # initialize
-    if 'dirty' not in st.session_state:
-        st.session_state['dirty'] = False
-    engine = init_db()
+# ---------- Local session storage fallback ----------
+if "users_local" not in st.session_state:
+    st.session_state["users_local"] = {}  # email -> {password_hash, created_at}
+if "data_local" not in st.session_state:
+    st.session_state["data_local"] = {}   # email -> {"transactions":DataFrame, "reminders":DataFrame, "goals":DataFrame}
 
-    # Sidebar: Login (simple PIN) & settings
-    with st.sidebar:
-        st.header("Account")
-        if 'logged_in' not in st.session_state:
-            st.session_state['logged_in'] = False
-        pin = st.text_input("Enter 4-digit PIN (set for this session)", type='password')
-        if st.button("Login / Set PIN"):
-            if pin and len(pin) == 4 and pin.isdigit():
-                st.session_state['pin'] = pin
-                st.session_state['logged_in'] = True
-                st.success("PIN set for this session. For biometric, integrate OS-level auth in deployment.")
-            else:
-                st.error("Please enter a 4-digit numeric PIN.")
-
-        st.markdown("---")
-        st.header("Settings")
-        alert_threshold = st.slider("Spending Alert Threshold (%)", min_value=50, max_value=150, value=int(ALERT_THRESHOLD_DEFAULT*100))
-        categories = st.text_area("Categories (comma separated)", value=',' .join(DEFAULT_CATEGORIES))
-        categories = [c.strip() for c in categories.split(',') if c.strip()]
-        st.markdown("**Cloud Sync (optional)**: Provide path to cloud-backed DB (e.g., mounted drive or URL).\nCurrently a placeholder — integrate with Firebase / GDrive in deployment.")
-
-    if not st.session_state['logged_in']:
-        st.info("Please set a PIN to continue (session-only).")
-        st.stop()
-
-    # Top menu
-    menu = st.radio("Go to", ["Dashboard", "Add Transaction", "Recurring", "Budgets", "Goals", "Reports & Export", "Receipt OCR", "Settings"], index=0)
-
-    # Load fresh data
-    df = load_transactions()
-    recurring = pd.read_sql('SELECT * FROM recurring', engine) if engine else pd.DataFrame()
-    budgets = pd.read_sql('SELECT * FROM budgets', engine) if engine else pd.DataFrame()
-    goals = pd.read_sql('SELECT * FROM goals', engine) if engine else pd.DataFrame()
-
-    # --- ADD TRANSACTION ---
-    if menu == 'Add Transaction':
-        st.header("Add Income / Expense")
-        col1, col2 = st.columns(2)
-        with col1:
-            ttype = st.selectbox("Type", ['Expense','Income'])
-            date = st.date_input("Date", value=datetime.now())
-            category = st.selectbox("Category", categories)
-        with col2:
-            amount = st.number_input("Amount", min_value=0.0, format="%.2f")
-            note = st.text_input("Note")
-            if st.button("Add Transaction"):
-                if amount <= 0:
-                    st.error("Enter a positive amount")
-                else:
-                    add_transaction(date, ttype, category, amount, note)
-                    st.success("Transaction added")
-
-    # --- RECURRING ---
-    if menu == 'Recurring':
-        st.header("Recurring Payments (EMI, Rent, Subscriptions)")
-        with st.expander("Add Recurring Item"):
-            name = st.text_input("Name")
-            cat = st.selectbox("Category", categories)
-            amt = st.number_input("Amount", min_value=0.0, format="%.2f", key='rec_amt')
-            start = st.date_input("Start Date", value=datetime.now(), key='rec_start')
-            freq = st.selectbox("Frequency", ['Monthly','Weekly','Daily','Yearly'])
-            note = st.text_input("Note", key='rec_note')
-            if st.button("Add Recurring"):
-                add_recurring(name, cat, amt, start, freq, note)
-                st.success("Recurring added")
-        st.markdown("---")
-        st.subheader("Existing Recurring Items")
-        if not recurring.empty:
-            recurring['start_date'] = pd.to_datetime(recurring['start_date'])
-            st.dataframe(recurring)
-            if st.button("Generate next month recurring transactions"):
-                # expand recurring into transactions for next 30 days
-                cutoff = datetime.now() + timedelta(days=30)
-                for _, row in recurring.iterrows():
-                    add_transaction(row['start_date'], 'Expense', row['category'], row['amount'], note=f"Recurring: {row['name']}", recurring_id=row['id'])
-                st.success("Added recurring transactions (sample)")
-        else:
-            st.info("No recurring items set.")
-
-    # --- BUDGETS ---
-    if menu == 'Budgets':
-        st.header("Budgets per Category")
-        with st.expander("Add Budget"):
-            bcat = st.selectbox("Category", categories, key='bcat')
-            period = st.selectbox("Period", ['Weekly','Monthly','Yearly'])
-            bamt = st.number_input("Budget Amount", min_value=0.0, format="%.2f", key='bamt')
-            if st.button("Save Budget"):
-                add_budget(bcat, period, bamt)
-                st.success('Budget saved')
-        st.markdown("---")
-        st.subheader('Current Budgets')
-        if not budgets.empty:
-            st.dataframe(budgets)
-        else:
-            st.info('No budgets set yet.')
-
-    # --- GOALS ---
-    if menu == 'Goals':
-        st.header('Savings Goals')
-        with st.expander('Create Goal'):
-            gname = st.text_input('Goal Name')
-            gtarget = st.number_input('Target Amount', min_value=0.0, format='%.2f', key='gtarget')
-            gcurrent = st.number_input('Starting Amount', min_value=0.0, format='%.2f', key='gcurrent')
-            gdeadline = st.date_input('Deadline', value=datetime.now()+timedelta(days=90), key='gdeadline')
-            gnote = st.text_input('Note')
-            if st.button('Create Goal'):
-                add_goal(gname, gtarget, gcurrent, gdeadline, gnote)
-                st.success('Goal created')
-        st.markdown('---')
-        st.subheader('Active Goals')
-        if not goals.empty:
-            goals['deadline'] = pd.to_datetime(goals['deadline'])
-            for _, g in goals.iterrows():
-                progress = 0 if g['target_amount'] == 0 else (g['current_amount'] / g['target_amount'])
-                st.write(f"**{g['name']}** — Target: {g['target_amount']} | Current: {g['current_amount']} | Deadline: {g['deadline'].date()}")
-                st.progress(min(max(progress,0),1))
-                if progress >= 1:
-                    st.balloons()
-        else:
-            st.info('No goals yet.')
-
-    # --- DASHBOARD ---
-    if menu == 'Dashboard':
-        st.header('Overview')
-        # filter options
-        range_map = {
-            '1 Week': 7,
-            '1 Month': 30,
-            '3 Months': 90,
-            '6 Months': 180,
-            '1 Year': 365,
-            'All': 10000
+def ensure_local_user_data(email):
+    if email not in st.session_state["data_local"]:
+        st.session_state["data_local"][email] = {
+            "transactions": pd.DataFrame(columns=["date","type","category","amount","notes"]),
+            "reminders": pd.DataFrame(columns=["name","amount","due"]),
+            "goals": pd.DataFrame(columns=["goal","target","saved","deadline"])
         }
-        rng = st.selectbox('History Range', list(range_map.keys()), index=1)
-        days = range_map[rng]
-        cutoff = datetime.now() - timedelta(days=days)
-        df = load_transactions()
-        df_filtered = df[df['date'] >= cutoff]
 
-        if df_filtered.empty:
-            st.info('No transactions for the selected period.')
+# ---------- Auth UI ----------
+st.sidebar.header("Account")
+auth_mode = st.sidebar.radio("Mode", ["Login", "Register", "Guest"])
+
+if auth_mode in ("Login", "Register"):
+    email = st.sidebar.text_input("Email")
+    password = st.sidebar.text_input("Password", type="password")
+
+login_button = st.sidebar.button("Proceed")
+
+current_user = None
+if login_button:
+    if auth_mode == "Register":
+        if not email or not password:
+            st.sidebar.error("Provide email and password")
         else:
-            # cash flow timeline
-            flow = df_filtered.copy()
-            flow['sign'] = flow['type'].apply(lambda x: 1 if x == 'Income' else -1)
-            flow['net'] = flow['amount'] * flow['sign']
-            timeline = flow.groupby(pd.Grouper(key='date', freq='D')).sum().reset_index()
-            if timeline.empty:
-                st.info('Not enough data for timeline')
-            else:
-                fig = px.area(timeline, x='date', y='net', title='Cash Flow (Income vs Expense)')
-                st.plotly_chart(fig, use_container_width=True)
-
-            # category breakdown
-            cat_sum = df_filtered.groupby('category').apply(lambda x: x[x['type']=='Expense']['amount'].sum()).reset_index(name='expense')
-            cat_sum = cat_sum.sort_values('expense', ascending=False)
-            if not cat_sum.empty:
-                fig2 = px.pie(cat_sum, values='expense', names='category', title='Spending by Category')
-                st.plotly_chart(fig2, use_container_width=True)
-
-            # spending pattern (bar)
-            daily = flow.groupby([pd.Grouper(key='date', freq='D'), 'type'])['amount'].sum().unstack(fill_value=0).reset_index()
-            if not daily.empty:
-                fig3 = px.bar(daily, x='date', y=['Expense','Income'], title='Daily Income & Expense')
-                st.plotly_chart(fig3, use_container_width=True)
-
-            # Alerts if overspent vs budgets
-            st.subheader('Budget Alerts')
-            if not budgets.empty:
-                budget_alerts = []
-                for _, b in budgets.iterrows():
-                    per = b['period']
-                    if per == 'Monthly':
-                        p_cut = datetime.now() - timedelta(days=30)
-                    elif per == 'Weekly':
-                        p_cut = datetime.now() - timedelta(days=7)
-                    elif per == 'Yearly':
-                        p_cut = datetime.now() - timedelta(days=365)
-                    else:
-                        p_cut = datetime.now() - timedelta(days=30)
-                    used = df[(df['category']==b['category']) & (df['date'] >= p_cut) & (df['type']=='Expense')]['amount'].sum()
-                    if used >= b['amount'] * (alert_threshold/100.0):
-                        budget_alerts.append((b['category'], used, b['amount']))
-                if budget_alerts:
-                    for cat, used, amt in budget_alerts:
-                        st.warning(f"You have used ₹{used:.2f} of ₹{amt:.2f} for {cat} (>= {alert_threshold}%). Consider reducing spend or increase budget.")
+            hashed = hash_password(password)
+            if use_firestore:
+                if firestore_get_user(email):
+                    st.sidebar.error("User exists. Please login.")
                 else:
-                    st.success('All budgets are within threshold.')
+                    firestore_create_user(email, hashed)
+                    st.sidebar.success("Registered! You can login now.")
             else:
-                st.info('No budgets set to show alerts.')
+                if email in st.session_state["users_local"]:
+                    st.sidebar.error("User exists (local). Please login.")
+                else:
+                    st.session_state["users_local"][email] = {"password_hash": hashed, "created_at": datetime.utcnow().isoformat()}
+                    ensure_local_user_data(email)
+                    st.sidebar.success("Local account created. You can login now.")
+    elif auth_mode == "Login":
+        if not email or not password:
+            st.sidebar.error("Provide email and password")
+        else:
+            hashed = hash_password(password)
+            if use_firestore:
+                user = firestore_get_user(email)
+                if not user:
+                    st.sidebar.error("User not found. Register first.")
+                elif user.get("password_hash") != hashed:
+                    st.sidebar.error("Incorrect password.")
+                else:
+                    st.session_state["user_email"] = email
+                    st.sidebar.success("Logged in.")
+            else:
+                local = st.session_state["users_local"].get(email)
+                if not local:
+                    st.sidebar.error("Local user not found. Register first.")
+                elif local.get("password_hash") != hashed:
+                    st.sidebar.error("Incorrect password.")
+                else:
+                    st.session_state["user_email"] = email
+                    ensure_local_user_data(email)
+                    st.sidebar.success("Logged in (local).")
+else:
+    # Guest mode
+    if auth_mode == "Guest":
+        if st.sidebar.button("Continue as Guest"):
+            st.session_state["user_email"] = "guest@local"
+            ensure_local_user_data(st.session_state["user_email"])
+            st.sidebar.success("Continuing as guest (local only).")
 
-            # Forecast sample: predict next 3 periods total expense
-            st.subheader('Simple Forecast (Trend-based)')
-            total_by_day = df_filtered[df_filtered['type']=='Expense'].groupby(pd.Grouper(key='date', freq='D'))['amount'].sum()
-            preds = small_forecast(total_by_day, periods=7)
-            forecast_df = pd.DataFrame({'date': [datetime.now().date()+timedelta(days=i+1) for i in range(len(preds))], 'predicted_expense': preds})
-            st.dataframe(forecast_df)
+# If user logged in, load dashboard
+if "user_email" not in st.session_state:
+    st.info("Please register / login in the sidebar to continue. Or choose Guest.")
+    st.stop()
 
-    # --- REPORTS & EXPORT ---
-    if menu == 'Reports & Export':
-        st.header('Reports & Export')
-        df = load_transactions()
-        st.dataframe(df)
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button('Download Excel'):
-                data = df_to_excel_bytes(df)
-                st.download_button('Click to download Excel', data, file_name='transactions.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        with col2:
-            if st.button('Download PDF'):
-                data = df_to_pdf_bytes(df, title='Transactions Report')
-                st.download_button('Click to download PDF', data, file_name='transactions.pdf', mime='application/pdf')
+user_email = st.session_state["user_email"]
+st.write(f"**Signed in as:** {user_email}")
 
-    # --- RECEIPT OCR ---
-    if menu == 'Receipt OCR':
-        st.header('Receipt Scanner (OCR)')
-        st.write('Upload an image of a receipt (jpg, png). Tesseract must be installed on your machine for OCR to work well.')
-        uploaded = st.file_uploader('Upload receipt image', type=['png','jpg','jpeg'])
-        if uploaded is not None:
-            txt = extract_text_from_image(uploaded)
-            st.text_area('Extracted Text', value=txt, height=300)
-            # attempt to parse amounts date
-            amounts = []
-            for token in txt.replace('\n',' ').split(' '):
-                try:
-                    val = float(token.replace('₹','').replace(',',''))
-                    amounts.append(val)
-                except:
-                    pass
-            if amounts:
-                st.write('Detected amounts (possible totals):', amounts[:5])
+# Ensure local data if not using Firestore
+if not use_firestore:
+    ensure_local_user_data(user_email)
 
-    # --- SETTINGS ---
-    if menu == 'Settings':
-        st.header('Advanced Settings & Notes')
-        st.markdown('''
-- **Cloud Sync:** To enable cloud sync, mount a remote DB or integrate Firebase/Google Drive. Replace DB_PATH with your cloud path.
-- **Biometric Login:** Streamlit apps run in browser—biometric auth requires integrating with the hosting platform (mobile app wrapper or OAuth). This app provides a PIN-based session login as a simple alternative.
-- **Background reminders/notifications:** For push reminders, integrate with a scheduled job (cron) or use services like OneSignal / Firebase Cloud Messaging and connect via a backend.
-- **Security:** Protect the SQLite file and use HTTPS in deployment. For multi-device sync, use a central DB and user authentication (Auth0 / Firebase Auth).
-''')
+# ---------- App main UI ----------
+menu = st.radio("Main", ["Add Transaction", "Dashboard", "Reminders & Email", "Receipt OCR", "Export Data", "Logout"])
 
-    # If we made changes, clear cache so load_transactions updates
-    if st.session_state['dirty']:
-        load_transactions.clear()
-        st.session_state['dirty'] = False
+# Common categories
+categories = ["Food","Travel","Rent","EMI","Bills","Subscriptions","Entertainment","Shopping","Groceries","Other"]
 
+# ----- Add Transaction -----
+if menu == "Add Transaction":
+    st.header("➕ Add Transaction")
+    col1, col2 = st.columns(2)
+    with col1:
+        tx_type = st.selectbox("Type", ["Expense","Income"])
+        tx_cat = st.selectbox("Category", categories)
+    with col2:
+        tx_amount = st.number_input("Amount", min_value=1.0)
+        tx_notes = st.text_input("Notes")
+    tx_date = st.date_input("Date", value=datetime.now())
 
-if __name__ == '__main__':
-    main()
+    if st.button("Save Transaction"):
+        tx = {
+            "date": tx_date.isoformat(),
+            "type": tx_type,
+            "category": tx_cat,
+            "amount": float(tx_amount),
+            "notes": tx_notes
+        }
+        if use_firestore:
+            try:
+                firestore_save_transaction(user_email, tx)
+                st.success("Saved to Firestore.")
+            except Exception as e:
+                st.error(f"Cloud save failed: {e}")
+        else:
+            st.session_state["data_local"][user_email]["transactions"] = \
+                st.session_state["data_local"][user_email]["transactions"].append(tx, ignore_index=True)
+            st.success("Saved locally.")
+
+# ----- Dashboard -----
+elif menu == "Dashboard":
+    st.header("📊 Dashboard")
+    if use_firestore:
+        tx_df = firestore_get_transactions(user_email)
+        # convert date to datetime
+        if not tx_df.empty:
+            tx_df['date'] = pd.to_datetime(tx_df['date'])
+    else:
+        tx_df = st.session_state["data_local"][user_email]["transactions"].copy()
+        if not tx_df.empty:
+            tx_df['date'] = pd.to_datetime(tx_df['date'])
+
+    if tx_df.empty:
+        st.info("No transactions yet.")
+    else:
+        # quick summary
+        total_income = tx_df[tx_df['type']=="Income"]['amount'].sum() if 'type' in tx_df else 0
+        total_exp = tx_df[tx_df['type']=="Expense"]['amount'].sum() if 'type' in tx_df else 0
+        st.metric("Total Income", f"₹{total_income:.2f}")
+        st.metric("Total Expense", f"₹{total_exp:.2f}")
+        st.metric("Net", f"₹{(total_income - total_exp):.2f}")
+
+        st.subheader("Recent Transactions")
+        st.dataframe(tx_df.sort_values('date', ascending=False).head(20))
+
+        # Pie chart for expenses
+        exp = tx_df[tx_df['type']=="Expense"].groupby('category')['amount'].sum()
+        if not exp.empty:
+            fig1, ax1 = plt.subplots()
+            ax1.pie(exp.values, labels=exp.index, autopct="%1.1f%%")
+            ax1.set_title("Expense Breakdown")
+            st.pyplot(fig1)
+
+        # Cashflow over time (daily)
+        daily = tx_df.groupby(pd.Grouper(key='date', freq='D'))['amount'].sum().reset_index()
+        if not daily.empty:
+            fig2, ax2 = plt.subplots()
+            ax2.plot(daily['date'], daily['amount'])
+            ax2.set_title("Cash Flow (daily)")
+            st.pyplot(fig2)
+
+# ----- Reminders & Email -----
+elif menu == "Reminders & Email":
+    st.header("⏰ Bill Reminders & Email")
+
+    r_col1, r_col2 = st.columns(2)
+    with r_col1:
+        r_name = st.text_input("Bill / EMI Name")
+        r_amt = st.number_input("Amount", min_value=1.0)
+    with r_col2:
+        r_due = st.date_input("Due Date", value=datetime.now() + timedelta(days=7))
+        r_note = st.text_input("Note (optional)")
+
+    if st.button("Save Reminder"):
+        reminder = {"name": r_name, "amount": float(r_amt), "due": r_due.isoformat(), "note": r_note}
+        if use_firestore:
+            try:
+                firestore_save_reminder(user_email, reminder)
+                st.success("Reminder saved to Firestore.")
+            except Exception as e:
+                st.error(f"Cloud save failed: {e}")
+        else:
+            df = st.session_state["data_local"][user_email]["reminders"]
+            df = df.append(reminder, ignore_index=True)
+            st.session_state["data_local"][user_email]["reminders"] = df
+            st.success("Reminder saved locally.")
+
+    # Show upcoming reminders
+    st.subheader("Upcoming reminders (next 30 days)")
+    if use_firestore:
+        rem_df = firestore_get_reminders(user_email)
+        if not rem_df.empty:
+            rem_df['due'] = pd.to_datetime(rem_df['due'])
+            upcoming = rem_df[rem_df['due'] <= (datetime.now() + timedelta(days=30))]
+            st.dataframe(upcoming)
+        else:
+            st.info("No reminders saved.")
+    else:
+        rem_df = st.session_state["data_local"][user_email]["reminders"]
+        if not rem_df.empty:
+            rem_df['due'] = pd.to_datetime(rem_df['due'])
+            st.dataframe(rem_df[rem_df['due'] <= (datetime.now() + timedelta(days=30))])
+        else:
+            st.info("No reminders saved.")
+
+    # Send reminders via email
+    st.markdown("---")
+    st.subheader("Send due reminders via Email")
+    st.write("This will send reminder emails immediately (requires SMTP configured in .env).")
+
+    if st.button("Send due reminders now"):
+        # collect due reminders
+        if use_firestore:
+            rem_df = firestore_get_reminders(user_email)
+            if rem_df.empty:
+                st.info("No reminders to send.")
+            else:
+                rem_df['due'] = pd.to_datetime(rem_df['due'])
+        else:
+            rem_df = st.session_state["data_local"][user_email]["reminders"]
+            if rem_df.empty:
+                st.info("No reminders to send.")
+            else:
+                rem_df['due'] = pd.to_datetime(rem_df['due'])
+
+        if not rem_df.empty:
+            to_send = rem_df[rem_df['due'] <= (datetime.now() + timedelta(days=7))]
+            if to_send.empty:
+                st.info("No reminders due within the next 7 days.")
+            else:
+                if not (SMTP_SERVER and SMTP_PORT and SMTP_EMAIL and SMTP_PASSWORD):
+                    st.warning("SMTP not configured. Set SMTP_SERVER, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD in .env to enable email sending.")
+                sent_count = 0
+                for _, row in to_send.iterrows():
+                    subject = f"Reminder: {row.get('name','Bill')} due on {row['due'].date() if hasattr(row['due'],'date') else row['due']}"
+                    body = f"Hi,\n\nThis is a reminder that {row.get('name','a bill')} of amount ₹{row.get('amount',0)} is due on {row['due'].date() if hasattr(row['due'],'date') else row['due']}.\n\nNote: {row.get('note','')}\n\n— Smart Budget Planner"
+                    ok = send_email(user_email, subject, body)
+                    if ok:
+                        sent_count += 1
+                st.success(f"Sent {sent_count} reminder(s) to {user_email} (if SMTP configured).")
+
+# ----- Receipt OCR -----
+elif menu == "Receipt OCR":
+    st.header("🧾 Receipt OCR")
+    uploaded = st.file_uploader("Upload receipt image", type=["png","jpg","jpeg"])
+    if uploaded:
+        img = Image.open(uploaded)
+        st.image(img, caption="Uploaded")
+        text = pytesseract.image_to_string(img)
+        st.subheader("Extracted text")
+        st.write(text)
+
+# ----- Export Data -----
+elif menu == "Export Data":
+    st.header("📤 Export Data")
+    if use_firestore:
+        tx_df = firestore_get_transactions(user_email)
+    else:
+        tx_df = st.session_state["data_local"][user_email]["transactions"]
+
+    if tx_df is None or tx_df.empty:
+        st.info("No transactions available.")
+    else:
+        st.dataframe(tx_df)
+        csv = tx_df.to_csv(index=False).encode()
+        st.download_button("Download CSV", csv, file_name="transactions.csv", mime="text/csv")
+        # Excel
+        excel = io.BytesIO()
+        tx_df.to_excel(excel, index=False)
+        st.download_button("Download Excel", excel.getvalue(), file_name="transactions.xlsx")
+
+# ----- Logout -----
+elif menu == "Logout":
+    if st.button("Logout now"):
+        st.session_state.pop("user_email", None)
+        st.experimental_rerun()
