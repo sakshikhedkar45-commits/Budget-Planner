@@ -1,1 +1,10 @@
-pip install streamlit pandas matplotlib pillow pytesseract firebase-admin google-cloud-firestore python-dotenv
+streamlit
+pandas
+plotly
+firebase_admin
+opencv-python-headless
+pytesseract
+Pillow
+numpy
+matplotlib
+scikit-learn
